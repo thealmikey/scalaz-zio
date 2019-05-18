@@ -1,150 +1,151 @@
-// Copyright (C) 2017-2018 Łukasz Biały, Paul Chiusano, Michael Pilquist,
-// Oleg Pyzhcov, Fabio Labella, Alexandru Nedelcu, Pavel Chlupacek. All rights reserved.
+/*
+ * Copyright 2017-2019 John A. De Goes and the ZIO Contributors
+ * Copyright 2017-2018 Łukasz Biały, Paul Chiusano, Michael Pilquist,
+ * Oleg Pyzhcov, Fabio Labella, Alexandru Nedelcu, Pavel Chlupacek.
+ *
+ * All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package scalaz.zio
 
 import internals._
-import scalaz.zio.ExitResult.Terminated
 
 import scala.annotation.tailrec
 import scala.collection.immutable.{ Queue => IQueue }
 
-final class Semaphore private (private val state: Ref[State]) {
+/**
+ * An asynchronous semaphore, which is a generalization of a mutex. Semaphores
+ * have a certain number of permits, which can be held and released
+ * concurrently by different parties. Attempts to acquire more permits than
+ * available result in the acquiring fiber being suspended until the specified
+ * number of permits become available.
+ **/
+final class Semaphore private (private val state: Ref[State]) extends Serializable {
 
-  def count: IO[Nothing, Long] = state.get.map(count_)
-
-  def available: IO[Nothing, Long] = state.get.map {
+  /**
+   * The number of permits currently available.
+   */
+  final def available: UIO[Long] = state.get.map {
     case Left(_)  => 0
     case Right(n) => n
   }
 
-  def acquire: IO[Nothing, Unit] = acquireN(1)
+  /**
+   * Acquires a single permit. This must be paired with `release` in a safe
+   * fashion in order to avoid leaking permits.
+   *
+   * If a permit is not available, the fiber invoking this method will be
+   * suspended until a permit is available.
+   */
+  final def acquire: UIO[Unit] = acquireN(1)
 
-  def release: IO[Nothing, Unit] = releaseN(1)
+  /**
+   * Releases a single permit.
+   */
+  final def release: UIO[Unit] = releaseN(1)
 
-  def withPermit[E, A](task: IO[E, A]): IO[E, A] =
-    IO.bracket[E, Unit, A](acquire)(_ => release)(_ => task)
+  final def withPermit[R, E, A](task: ZIO[R, E, A]): ZIO[R, E, A] =
+    prepare(1L).bracket(_.release)(_.awaitAcquire *> task)
 
-  def acquireN(requested: Long): IO[Nothing, Unit] =
-    assertNonNegative(requested) *>
-      mkGate.flatMap { gate =>
-        state.update {
-          case Left((head, queue)) =>
-            Left(head -> queue.enqueue(requested -> gate))
-          case Right(available) =>
-            if (requested <= available) Right(available - requested)
-            else Left(((requested - available) -> gate, IQueue.empty[Entry]))
+  /**
+   * Acquires a specified number of permits.
+   *
+   * If the specified number of permits are not available, the fiber invoking
+   * this method will be suspended until the permits are available.
+   *
+   * Ported from @mpilquist work in cats-effects (https://github.com/typelevel/cats-effect/pull/403)
+   */
+  final def acquireN(n: Long): UIO[Unit] = {
+    // TODO: Dotty doesn't infer this properly
+    val i0: ZIO.BracketExitRelease[Any, Nothing, Nothing, Acquisition, Unit] = IO.bracketExit(prepare(n))(cleanup)
+    val i1: UIO[Unit]                                                        = i0(_.awaitAcquire)
+    assertNonNegative(n) *> i1
+  }
 
-        }.flatMap {
-          case Left((head, _)) => awaitGate(head)
-          case Right(_)        => IO.unit
+  /**
+   * Ported from @mpilquist work in cats-effects (https://github.com/typelevel/cats-effect/pull/403)
+   */
+  final private def prepare(n: Long): UIO[Acquisition] = {
+    def restore(p: Promise[Nothing, Unit], n: Long): UIO[Unit] =
+      IO.flatten(state.modify {
+        case Left(q) =>
+          q.find(_._1 == p).fold(releaseN(n) -> Left(q))(x => releaseN(n - x._2) -> Left(q.filter(_._1 != p)))
+        case Right(m) => IO.unit -> Right(m + n)
+      })
+
+    if (n == 0)
+      IO.succeed(Acquisition(IO.unit, IO.unit))
+    else
+      Promise.make[Nothing, Unit].flatMap { p =>
+        state.modify {
+          case Right(m) if m >= n => Acquisition(IO.unit, releaseN(n))   -> Right(m - n)
+          case Right(m)           => Acquisition(p.await, restore(p, n)) -> Left(IQueue(p -> (n - m)))
+          case Left(q)            => Acquisition(p.await, restore(p, n)) -> Left(q.enqueue(p -> n))
         }
       }
+  }
 
-  def releaseN(toRelease: Long): IO[Nothing, Unit] =
-    assertNonNegative(toRelease) *>
-      state.modify { old =>
-        @tailrec def releaseRecursively(waiting: NonEmptyQueue, available: Long): State =
-          waiting match {
-            // n + 1 in queue case
-            case ((requested, gate), tail) if tail.nonEmpty && available > 0 =>
-              if (requested > available) releaseRecursively(((requested - available, gate), tail), available = 0)
-              else releaseRecursively(tail.dequeue, available - requested)
-            // 1 in queue case
-            case ((requested, gate), tail) if tail.isEmpty && available > 0 =>
-              if (requested > available) Left(((requested - available, gate), tail))
-              else Right(available - requested)
-            // n in queue but no more to release
-            case nonEmptyQueue if available == 0 => Left(nonEmptyQueue)
-          }
+  final private def cleanup[E, A](ops: Acquisition, res: Exit[E, A]): UIO[Unit] =
+    res match {
+      case Exit.Failure(c) if c.interrupted => ops.release
+      case _                                => IO.unit
+    }
 
-        val updated: State = old match {
-          case Left(waiting) =>
-            releaseRecursively(waiting, toRelease)
-          case Right(available) =>
-            Right(available + toRelease)
+  final def releaseN(toRelease: Long): UIO[Unit] = {
+
+    @tailrec def loop(n: Long, state: State, acc: UIO[Unit]): (UIO[Unit], State) = state match {
+      case Right(m) => acc -> Right(n + m)
+      case Left(q) =>
+        q.dequeueOption match {
+          case None => acc -> Right(n)
+          case Some(((p, m), q)) =>
+            if (n > m)
+              loop(n - m, Left(q), acc <* p.succeed(()))
+            else if (n == m)
+              (acc <* p.succeed(())) -> Left(q)
+            else
+              acc -> Left((p -> (m - n)) +: q)
         }
+    }
 
-        ((old, updated), updated)
-      }.flatMap {
-        case (previous, now) =>
-          previous match {
-            case Left(neq) =>
-              val newSize = now match {
-                case Left(newNeq) => newNeq.size
-                case Right(_)     => 0
-              }
-              val released = neq.size - newSize
-              neq.take(released).foldRight(IO.unit) { (entry, unit) =>
-                openGate(entry) *> unit
-              }
-            case Right(_) => IO.unit
-          }
-      }
+    IO.flatten(assertNonNegative(toRelease) *> state.modify(loop(toRelease, _, IO.unit))).uninterruptible
 
-  private def mkGate: IO[Nothing, Promise[Nothing, Unit]] = Promise.make[Nothing, Unit]
-
-  private def awaitGate(entry: (Long, Promise[Nothing, Unit])): IO[Nothing, Unit] =
-    IO.unit.bracket0[Nothing, Unit] { (_, useOutcome) =>
-      useOutcome match {
-        case _: Terminated[Nothing, Unit] => // Terminated outcome means either interruption or uncaught exception
-          state.update {
-            case Left((current, rest)) =>
-              // if entry is NonEmpty's head and queue is empty, swap to Right, but without any permits
-              if (current == entry && rest.isEmpty) Right(0)
-              // if entry is NonEmpty's head and queue is not empty, just drop this entry from head position
-              else if (current == entry && rest.nonEmpty) Left(rest.dequeue)
-              // this entry is not current NonEmpty's head, just drop it from queue
-              else Left((current, rest.filter(_ != entry)))
-
-            case Right(m) => Right(m)
-          }.void
-        case _ =>
-          IO.unit
-      }
-    }(_ => entry._2.get)
-
-  private def openGate[E](entry: (Long, Promise[E, Unit])): IO[E, Unit] =
-    entry._2.complete(()).void
-
-  private def count_(state: State): Long = state match {
-    case Left((head, tail)) => -(head._1 + tail.map(_._1).sum)
-    case Right(available)   => available
   }
 
 }
 
-object Semaphore {
-  def apply(permits: Long): IO[Nothing, Semaphore] = Ref[State](Right(permits)).map(new Semaphore(_))
+object Semaphore extends Serializable {
+
+  /**
+   * Creates a new `Sempahore` with the specified number of permits.
+   */
+  final def make(permits: Long): UIO[Semaphore] = Ref.make[State](Right(permits)).map(new Semaphore(_))
 }
 
 private object internals {
 
-  type NonEmpty[F[_], A] = (A, F[A])
+  final case class Acquisition(awaitAcquire: UIO[Unit], release: UIO[Unit])
 
-  type Entry = (Long, Promise[Nothing, Unit])
+  type Entry = (Promise[Nothing, Unit], Long)
 
-  type NonEmptyQueue = NonEmpty[IQueue, Entry]
+  type State = Either[IQueue[Entry], Long]
 
-  type State = Either[NonEmptyQueue, Long]
-
-  def assertNonNegative(n: Long): IO[Nothing, Unit] =
-    if (n < 0) IO.terminate(new NegativeArgument(s"Unexpected negative value `$n` passed to acquireN or releaseN."))
+  def assertNonNegative(n: Long): UIO[Unit] =
+    if (n < 0)
+      IO.die(new NegativeArgument(s"Unexpected negative value `$n` passed to acquireN or releaseN."))
     else IO.unit
 
   class NegativeArgument(message: String) extends IllegalArgumentException(message)
-
-  implicit class NonEmptyQueueOps(val nonEmptyQueue: NonEmptyQueue) extends AnyVal {
-    def size: Int                   = nonEmptyQueue._2.size + 1
-    def take(n: Int): NonEmptyQueue = (nonEmptyQueue._1, nonEmptyQueue._2.take(n - 1))
-    def foldRight[B](zero: => B)(f: (Entry, B) => B): B = {
-      @tailrec def foldR(acc: B, neq: NonEmptyQueue): B = neq match {
-        case (head, tail) if tail.nonEmpty => foldR(f(head, acc), tail.dequeue)
-        case (head, tail) if tail.isEmpty  => f(head, acc)
-      }
-
-      foldR(zero, nonEmptyQueue)
-    }
-  }
-
 }

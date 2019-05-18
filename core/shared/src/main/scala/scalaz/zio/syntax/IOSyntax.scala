@@ -1,43 +1,41 @@
+/*
+ * Copyright 2017-2019 John A. De Goes and the ZIO Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package scalaz.zio.syntax
-import scalaz.zio.{ Fiber, IO }
+
+import scalaz.zio.{ Fiber, IO, Task, UIO }
 
 object IOSyntax {
   final class IOCreationLazySyntax[A](val a: () => A) extends AnyVal {
-    def point: IO[Nothing, A]                                   = IO.point(a())
-    def sync: IO[Nothing, A]                                    = IO.sync(a())
-    def syncException: IO[Exception, A]                         = IO.syncException(a())
-    def syncThrowable: IO[Throwable, A]                         = IO.syncThrowable(a())
-    def syncCatch[E]: PartialFunction[Throwable, E] => IO[E, A] = IO.syncCatch(a())
+    def succeedLazy: UIO[A] = IO.succeedLazy(a())
+    def defer: UIO[A]       = IO.effectTotal(a())
+    def sync: Task[A]       = Task.effect(a())
   }
 
   final class IOCreationEagerSyntax[A](val a: A) extends AnyVal {
-    def now: IO[Nothing, A]                         = IO.now(a)
+    def succeed: UIO[A]                             = IO.succeed(a)
     def fail: IO[A, Nothing]                        = IO.fail(a)
     def require[AA]: IO[A, Option[AA]] => IO[A, AA] = IO.require(a)
   }
 
-  final class IOFlattenSyntax[E, A](val io: IO[E, IO[E, A]]) extends AnyVal {
-    def flatten: IO[E, A] = IO.flatten(io)
-  }
-
-  final class IOAbsolveSyntax[E, A](val io: IO[E, Either[E, A]]) extends AnyVal {
-    def absolved: IO[E, A] = IO.absolve(io)
-  }
-
-  final class IOUnsandboxedSyntax[E, A](val io: IO[Either[List[Throwable], E], A]) extends AnyVal {
-    def unsandboxed: IO[E, A] = IO.unsandbox(io)
-  }
-
   final class IOIterableSyntax[E, A](val ios: Iterable[IO[E, A]]) extends AnyVal {
-    def mergeAll[B](zero: B, f: (B, A) => B): IO[E, B] = IO.mergeAll(ios)(zero, f)
-    def parAll: IO[E, List[A]]                         = IO.parAll(ios)
-    def forkAll: IO[Nothing, Fiber[E, List[A]]]        = IO.forkAll(ios)
-    def sequence: IO[E, List[A]]                       = IO.sequence(ios)
-  }
-
-  final class IOSyntax[E, A](val io: IO[E, A]) extends AnyVal {
-    def raceAll(ios: Iterable[IO[E, A]]): IO[E, A] = IO.raceAll(io, ios)
-    def supervise: IO[E, A]                        = IO.supervise(io)
+    def mergeAll[B](zero: B)(f: (B, A) => B): IO[E, B] = IO.mergeAll(ios)(zero)(f)
+    def collectAllPar: IO[E, List[A]]                  = IO.collectAllPar(ios)
+    def forkAll: UIO[Fiber[E, List[A]]]                = IO.forkAll(ios)
+    def collectAll: IO[E, List[A]]                     = IO.collectAll(ios)
   }
 
   final class IOTuple2[E, A, B](val ios2: (IO[E, A], IO[E, B])) extends AnyVal {

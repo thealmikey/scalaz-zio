@@ -4,7 +4,6 @@ import java.util.concurrent.TimeUnit
 
 import org.openjdk.jmh.annotations._
 
-import scala.concurrent.duration.Duration
 import scala.collection.immutable.Range
 
 import IOBenchmarks.unsafeRun
@@ -28,9 +27,9 @@ class BubbleSortBenchmarks {
 
     unsafeRun(
       for {
-        array <- IO.sync[Array[Int]](createTestArray)
+        array <- IO.effectTotal[Array[Int]](createTestArray)
         _     <- bubbleSort[Int](_ <= _)(array)
-        _     <- IO.sync[Unit](assertSorted(array))
+        _     <- IO.effectTotal[Unit](assertSorted(array))
       } yield ()
     )
   }
@@ -55,6 +54,6 @@ class BubbleSortBenchmarks {
       array <- Task.eval(createTestArray)
       _     <- bubbleSort[Int](_ <= _)(array)
       _     <- Task.eval(assertSorted(array))
-    } yield ()).runSyncUnsafe(Duration.Inf)
+    } yield ()).runSyncUnsafe(scala.concurrent.duration.Duration.Inf)
   }
 }

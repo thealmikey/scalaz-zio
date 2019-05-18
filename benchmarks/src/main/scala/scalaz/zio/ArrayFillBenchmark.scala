@@ -4,7 +4,6 @@ import java.util.concurrent.TimeUnit
 
 import org.openjdk.jmh.annotations._
 
-import scala.concurrent.duration.Duration
 import scala.collection.immutable.Range
 
 @State(Scope.Thread)
@@ -20,10 +19,10 @@ class ArrayFillBenchmarks {
   def scalazArrayFill() = {
     import IOBenchmarks.unsafeRun
 
-    def arrayFill(array: Array[Int]): KleisliIO[Nothing, Int, Int] = {
-      val condition = KleisliIO.lift[Int, Boolean]((i: Int) => i < array.length)
+    def arrayFill(array: Array[Int]): FunctionIO[Nothing, Int, Int] = {
+      val condition = FunctionIO.fromFunction[Int, Boolean]((i: Int) => i < array.length)
 
-      KleisliIO.whileDo[Nothing, Int](condition)(KleisliIO.impureVoid[Int, Int] { (i: Int) =>
+      FunctionIO.whileDo[Nothing, Int](condition)(FunctionIO.effectTotal[Int, Int] { (i: Int) =>
         array.update(i, i)
 
         i + 1
@@ -32,11 +31,30 @@ class ArrayFillBenchmarks {
 
     unsafeRun(
       for {
-        array <- IO.sync[Array[Int]](createTestArray)
+        array <- IO.effectTotal[Array[Int]](createTestArray)
         _     <- arrayFill(array).run(0)
       } yield ()
     )
   }
+
+  @Benchmark
+  def monoArrayFill() = {
+    import reactor.core.publisher.Mono
+
+    def arrayFill(array: Array[Int])(i: Int): Mono[Unit] =
+      if (i >= array.length) Mono.fromSupplier(() => ())
+      else
+        Mono
+          .fromSupplier(() => array.update(i, i))
+          .flatMap(_ => arrayFill(array)(i + 1))
+
+    (for {
+      array <- Mono.fromSupplier(() => createTestArray)
+      _     <- arrayFill(array)(0)
+    } yield ())
+      .block()
+  }
+
   @Benchmark
   def catsArrayFill() = {
     import cats.effect.IO
@@ -50,10 +68,11 @@ class ArrayFillBenchmarks {
       _     <- arrayFill(array)(0)
     } yield ()).unsafeRunSync()
   }
+
   @Benchmark
   def monixArrayFill() = {
-    import monix.eval.Task
     import IOBenchmarks.monixScheduler
+    import monix.eval.Task
 
     def arrayFill(array: Array[Int])(i: Int): Task[Unit] =
       if (i >= array.length) Task.unit
@@ -62,6 +81,6 @@ class ArrayFillBenchmarks {
     (for {
       array <- Task.eval(createTestArray)
       _     <- arrayFill(array)(0)
-    } yield ()).runSyncUnsafe(Duration.Inf)
+    } yield ()).runSyncUnsafe(scala.concurrent.duration.Duration.Inf)
   }
 }

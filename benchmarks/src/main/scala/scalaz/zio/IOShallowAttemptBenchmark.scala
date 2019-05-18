@@ -1,11 +1,11 @@
-// Copyright (C) 2017-2018 John A. De Goes. All rights reserved.
 package scalaz.zio
 
 import java.util.concurrent.TimeUnit
-import org.openjdk.jmh.annotations._
-import scala.concurrent.Await
 
-import IOBenchmarks._
+import org.openjdk.jmh.annotations._
+import scalaz.zio.IOBenchmarks._
+
+import scala.concurrent.Await
 
 @State(Scope.Thread)
 @BenchmarkMode(Array(Mode.Throughput))
@@ -41,6 +41,76 @@ class IOShallowAttemptBenchmark {
   }
 
   @Benchmark
+  def completableFutureShallowAttempt(): BigInt = {
+    import java.util.concurrent.CompletableFuture
+
+    def throwup(n: Int): CompletableFuture[BigInt] =
+      if (n == 0) throwup(n + 1).exceptionally(_ => 0)
+      else if (n == depth) CompletableFuture.completedFuture(1)
+      else
+        throwup(n + 1)
+          .exceptionally(_ => 0)
+          .thenCompose(_ => {
+            val f = new CompletableFuture[BigInt]()
+            f.completeExceptionally(new Exception("Oh noes!"))
+            f
+          })
+
+    throwup(0)
+      .get()
+  }
+
+  @Benchmark
+  def monoShallowAttempt(): BigInt = {
+    import reactor.core.publisher.Mono
+
+    def throwup(n: Int): Mono[BigInt] =
+      if (n == 0) throwup(n + 1).onErrorReturn(0)
+      else if (n == depth) Mono.fromCallable(() => 1)
+      else
+        throwup(n + 1)
+          .onErrorReturn(0)
+          .flatMap(_ => Mono.error(new Exception("Oh noes!")))
+
+    throwup(0)
+      .block()
+  }
+
+  @Benchmark
+  def rxSingleShallowAttempt(): BigInt = {
+    import io.reactivex.Single
+
+    def throwup(n: Int): Single[BigInt] =
+      if (n == 0) throwup(n + 1).onErrorReturn(_ => 0)
+      else if (n == depth) Single.fromCallable(() => 1)
+      else
+        throwup(n + 1)
+          .onErrorReturn(_ => 0)
+          .flatMap(_ => Single.error(new Exception("Oh noes!")))
+
+    throwup(0)
+      .blockingGet()
+  }
+
+  @Benchmark
+  def twitterShallowAttempt(): BigInt = {
+    import com.twitter.util.{ Await, Future }
+    import com.twitter.util.{ Return, Throw }
+
+    def throwup(n: Int): Future[BigInt] =
+      if (n == 0) throwup(n + 1).rescue {
+        case _ => Future.value(0)
+      } else if (n == depth) Future(1)
+      else
+        throwup(n + 1).transform {
+          case Throw(_)  => Future.value[BigInt](0)
+          case Return(_) => Future.exception[BigInt](new Error("Oh noes!"))
+        }
+
+    Await.result(throwup(0))
+  }
+
+  @Benchmark
   def monixShallowAttempt(): BigInt = {
     import monix.eval.Task
 
@@ -53,15 +123,15 @@ class IOShallowAttemptBenchmark {
           case Right(_) => Task.raiseError(new Error("Oh noes!"))
         }
 
-    throwup(0).runSyncMaybe.right.get
+    throwup(0).runSyncStep.right.get
   }
 
   @Benchmark
   def scalazShallowAttempt(): BigInt = {
     def throwup(n: Int): IO[ScalazError, BigInt] =
-      if (n == 0) throwup(n + 1).redeemPure[ScalazError, BigInt](_ => 50, identity)
-      else if (n == depth) IO.point(1)
-      else throwup(n + 1).redeem[ScalazError, BigInt](_ => IO.now(0), _ => IO.fail(ScalazError("Oh noes!")))
+      if (n == 0) throwup(n + 1).fold[BigInt](_ => 50, identity)
+      else if (n == depth) IO.succeedLazy(1)
+      else throwup(n + 1).foldM[Any, ScalazError, BigInt](_ => IO.succeed(0), _ => IO.fail(ScalazError("Oh noes!")))
 
     unsafeRun(throwup(0))
   }
@@ -69,9 +139,9 @@ class IOShallowAttemptBenchmark {
   @Benchmark
   def scalazShallowAttemptBaseline(): BigInt = {
     def throwup(n: Int): IO[Error, BigInt] =
-      if (n == 0) throwup(n + 1).redeemPure[Error, BigInt](_ => 50, identity)
-      else if (n == depth) IO.point(1)
-      else throwup(n + 1).redeem[Error, BigInt](_ => IO.now(0), _ => IO.fail(new Error("Oh noes!")))
+      if (n == 0) throwup(n + 1).fold[BigInt](_ => 50, identity)
+      else if (n == depth) IO.succeedLazy(1)
+      else throwup(n + 1).foldM[Any, Error, BigInt](_ => IO.succeed(0), _ => IO.fail(new Error("Oh noes!")))
 
     unsafeRun(throwup(0))
   }

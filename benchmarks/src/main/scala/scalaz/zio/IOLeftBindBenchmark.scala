@@ -1,11 +1,11 @@
-// Copyright (C) 2017 John A. De Goes. All rights reserved.
 package scalaz.zio
 
 import java.util.concurrent.TimeUnit
-import org.openjdk.jmh.annotations._
-import scala.concurrent.Await
 
-import IOBenchmarks._
+import org.openjdk.jmh.annotations._
+import scalaz.zio.IOBenchmarks._
+
+import scala.concurrent.Await
 
 @State(Scope.Thread)
 @BenchmarkMode(Array(Mode.Throughput))
@@ -41,6 +41,66 @@ class IOLeftBindBenchmark {
   }
 
   @Benchmark
+  def completableFutureLeftBindBenchmark(): Int = {
+    import java.util.concurrent.CompletableFuture
+
+    def loop(i: Int): CompletableFuture[Int] =
+      if (i % depth == 0) CompletableFuture.completedFuture(i + 1).thenCompose(loop)
+      else if (i < size) loop(i + 1).thenCompose(i => CompletableFuture.completedFuture(i))
+      else CompletableFuture.completedFuture(i)
+
+    CompletableFuture
+      .completedFuture(0)
+      .thenCompose(loop)
+      .get()
+  }
+
+  @Benchmark
+  def monoLeftBindBenchmark(): Int = {
+    import reactor.core.publisher.Mono
+
+    def loop(i: Int): Mono[Int] =
+      if (i % depth == 0) Mono.fromSupplier(() => i + 1).flatMap(loop)
+      else if (i < size) loop(i + 1).flatMap(i => Mono.fromSupplier(() => i))
+      else Mono.fromSupplier(() => i)
+
+    Mono
+      .fromSupplier(() => 0)
+      .flatMap(loop)
+      .block()
+  }
+
+  @Benchmark
+  def rxSingleLeftBindBenchmark(): Int = {
+    import io.reactivex.Single
+
+    def loop(i: Int): Single[Int] =
+      if (i % depth == 0) Single.fromCallable(() => i + 1).flatMap(loop)
+      else if (i < size) loop(i + 1).flatMap(i => Single.fromCallable(() => i))
+      else Single.fromCallable(() => i)
+
+    Single
+      .fromCallable(() => 0)
+      .flatMap(loop)
+      .blockingGet()
+  }
+
+  @Benchmark
+  def twitterLeftBindBenchmark(): Int = {
+    import com.twitter.util.{ Await, Future }
+
+    def loop(i: Int): Future[Int] =
+      if (i % depth == 0) Future(i + 1).flatMap(loop)
+      else if (i < size) loop(i + 1).flatMap(i => Future(i))
+      else Future(i)
+
+    Await.result(
+      Future(0)
+        .flatMap(loop)
+    )
+  }
+
+  @Benchmark
   def monixLeftBindBenchmark(): Int = {
     import monix.eval.Task
 
@@ -49,17 +109,17 @@ class IOLeftBindBenchmark {
       else if (i < size) loop(i + 1).flatMap(i => Task.eval(i))
       else Task.eval(i)
 
-    Task.eval(0).flatMap(loop).runSyncMaybe.right.get
+    Task.eval(0).flatMap(loop).runSyncStep.right.get
   }
 
   @Benchmark
   def scalazLeftBindBenchmark(): Int = {
-    def loop(i: Int): IO[Nothing, Int] =
-      if (i % depth == 0) IO.point[Int](i + 1).flatMap(loop)
-      else if (i < size) loop(i + 1).flatMap(i => IO.point(i))
-      else IO.point(i)
+    def loop(i: Int): UIO[Int] =
+      if (i % depth == 0) IO.succeedLazy[Int](i + 1).flatMap(loop)
+      else if (i < size) loop(i + 1).flatMap(i => IO.succeedLazy(i))
+      else IO.succeedLazy(i)
 
-    unsafeRun(IO.point[Int](0).flatMap(loop))
+    unsafeRun(IO.succeedLazy(0).flatMap[Any, Nothing, Int](loop))
   }
 
   @Benchmark

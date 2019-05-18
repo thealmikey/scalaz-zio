@@ -1,9 +1,22 @@
-// Copyright (C) 2018 John A. De Goes. All rights reserved.
+/*
+ * Copyright 2017-2019 John A. De Goes and the ZIO Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package scalaz.zio
 
 import java.util.concurrent.atomic.AtomicReference
-
 import Promise.internal._
 
 /**
@@ -25,24 +38,34 @@ import Promise.internal._
 class Promise[E, A] private (private val state: AtomicReference[State[E, A]]) extends AnyVal {
 
   /**
+   * Checks for completion of this Promise. Produces true if this promise has
+   * already been completed with a value or an error and false otherwise.
+   */
+  final def isDone: UIO[Boolean] =
+    IO.effectTotal(state.get() match {
+      case Done(_)    => true
+      case Pending(_) => false
+    })
+
+  /**
    * Retrieves the value of the promise, suspending the fiber running the action
    * until the result is available.
    */
-  final def get: IO[E, A] =
-    IO.async0[E, A](k => {
-      var result: Async[E, A] = null.asInstanceOf[Async[E, A]]
-      var retry               = true
+  final def await: IO[E, A] =
+    IO.effectAsyncInterrupt[Any, E, A](k => {
+      var result = null.asInstanceOf[Either[Canceler, IO[E, A]]]
+      var retry  = true
 
       while (retry) {
         val oldState = state.get
 
         val newState = oldState match {
           case Pending(joiners) =>
-            result = Async.maybeLater[E, A](interruptJoiner(k))
+            result = Left(interruptJoiner(k))
 
             Pending(k :: joiners)
           case s @ Done(value) =>
-            result = Async.now[E, A](value)
+            result = Right(value)
 
             s
         }
@@ -54,66 +77,51 @@ class Promise[E, A] private (private val state: AtomicReference[State[E, A]]) ex
     })
 
   /**
-   * Retrieves immediately the ExitResult of this promise if done
-   * and fails immediately with Unit otherwise
+   * Completes immediately this promise and returns optionally it's result.
    */
-  final def poll: IO[Unit, ExitResult[E, A]] =
-    IO.sync(state.get).flatMap {
-      case Pending(_)       => IO.fail(())
-      case Done(exitResult) => IO.now(exitResult)
+  final def poll: UIO[Option[IO[E, A]]] =
+    IO.effectTotal(state.get).flatMap {
+      case Pending(_) => IO.succeed(None)
+      case Done(io)   => IO.succeed(Some(io))
     }
 
   /**
    * Completes the promise with the specified value.
    */
-  final def complete(a: A): IO[Nothing, Boolean] = done(ExitResult.Completed[E, A](a))
+  final def succeed(a: A): UIO[Boolean] = done(IO.succeed(a))
 
   /**
    * Fails the promise with the specified error, which will be propagated to all
    * fibers waiting on the value of the promise.
    */
-  final def error(e: E): IO[Nothing, Boolean] = done(ExitResult.Failed[E, A](e))
+  final def fail(e: E): UIO[Boolean] = done(IO.fail(e))
 
   /**
-   * Interrupts the promise with no specified reason. This will interrupt
-   * all fibers waiting on the value of the promise.
+   * Completes the promise with interruption. This will interrupt all fibers
+   * waiting on the value of the promise.
    */
-  final def interrupt: IO[Nothing, Boolean] = interrupt0(Nil)
-
-  /**
-   * Interrupts the promise with the specified throwable(s). This will interrupt
-   * all fibers waiting on the value of the promise.
-   */
-  final def interrupt(t: Throwable, ts: Throwable*): IO[Nothing, Boolean] = interrupt0(t :: ts.toList)
-
-  /**
-   * Interrupts the promise with the specified list of throwable(s). This will interrupt
-   * all fibers waiting on the value of the promise.
-   */
-  final protected def interrupt0(ts: List[Throwable]): IO[Nothing, Boolean] = done(ExitResult.Terminated[E, A](ts))
+  final def interrupt: UIO[Boolean] = done(IO.interrupt)
 
   /**
    * Completes the promise with the specified result. If the specified promise
    * has already been completed, the method will produce false.
    */
-  final def done(r: ExitResult[E, A]): IO[Nothing, Boolean] =
-    IO.flatten(IO.sync {
-      var action: IO[Nothing, Boolean] = null.asInstanceOf[IO[Nothing, Boolean]]
-      var retry                        = true
+  final def done(io: IO[E, A]): UIO[Boolean] =
+    IO.effectTotal {
+      var action: () => Boolean = null.asInstanceOf[() => Boolean]
+      var retry                 = true
 
       while (retry) {
         val oldState = state.get
 
         val newState = oldState match {
           case Pending(joiners) =>
-            action =
-              IO.forkAll(joiners.map(k => IO.sync[Unit](k(r)))) *>
-                IO.now[Boolean](true)
+            action = () => { joiners.foreach(_(io)); true }
 
-            Done(r)
+            Done(io)
 
           case Done(_) =>
-            action = IO.now[Boolean](false)
+            action = Promise.ConstFalse
 
             oldState
         }
@@ -121,10 +129,30 @@ class Promise[E, A] private (private val state: AtomicReference[State[E, A]]) ex
         retry = !state.compareAndSet(oldState, newState)
       }
 
-      action
-    })
+      action()
+    }
 
-  private def interruptJoiner(joiner: Callback[E, A]): Canceler = { () =>
+  private[zio] final def unsafeDone(io: IO[E, A]): Unit = {
+    var retry: Boolean                  = true
+    var joiners: List[IO[E, A] => Unit] = null
+
+    while (retry) {
+      val oldState = state.get
+
+      val newState = oldState match {
+        case Pending(js) =>
+          joiners = js
+          Done(io)
+        case _ => oldState
+      }
+
+      retry = !state.compareAndSet(oldState, newState)
+    }
+
+    if (joiners ne null) joiners.reverse.foreach(_(io))
+  }
+
+  private def interruptJoiner(joiner: IO[E, A] => Unit): Canceler = IO.effectTotal {
     var retry = true
 
     while (retry) {
@@ -143,11 +171,12 @@ class Promise[E, A] private (private val state: AtomicReference[State[E, A]]) ex
   }
 }
 object Promise {
+  private val ConstFalse: () => Boolean = () => false
 
   /**
    * Makes a new promise.
    */
-  final def make[E, A]: IO[Nothing, Promise[E, A]] = IO.sync[Promise[E, A]](unsafeMake[E, A])
+  final def make[E, A]: UIO[Promise[E, A]] = IO.effectTotal[Promise[E, A]](unsafeMake[E, A])
 
   private final def unsafeMake[E, A]: Promise[E, A] =
     new Promise[E, A](new AtomicReference[State[E, A]](new internal.Pending[E, A](Nil)))
@@ -160,10 +189,10 @@ object Promise {
   final def bracket[E, A, B, C](
     ref: Ref[A]
   )(
-    acquire: (Promise[E, B], A) => (IO[Nothing, C], A)
-  )(release: (C, Promise[E, B]) => IO[Nothing, Unit]): IO[E, B] =
+    acquire: (Promise[E, B], A) => (UIO[C], A)
+  )(release: (C, Promise[E, B]) => UIO[_]): IO[E, B] =
     for {
-      pRef <- Ref[Option[(C, Promise[E, B])]](None)
+      pRef <- Ref.make[Option[(C, Promise[E, B])]](None)
       b <- (for {
             p <- ref.modify { a: A =>
                   val p = Promise.unsafeMake[E, B]
@@ -172,15 +201,15 @@ object Promise {
 
                   ((p, io), a2)
                 }.flatMap {
-                  case (p, io) => io.flatMap(c => pRef.set(Some((c, p))) *> IO.now(p))
-                }.uninterruptibly
-            b <- p.get
-          } yield b).ensuring(pRef.get.flatMap(_.fold(IO.unit)(t => release(t._1, t._2))))
+                  case (p, io) => io.flatMap(c => pRef.set(Some((c, p))) *> IO.succeed(p))
+                }.uninterruptible
+            b <- p.await
+          } yield b).ensuring(pRef.get.flatMap(_.map(t => release(t._1, t._2)).getOrElse(IO.unit)))
     } yield b
 
   private[zio] object internal {
-    sealed trait State[E, A]
-    final case class Pending[E, A](joiners: List[Callback[E, A]]) extends State[E, A]
-    final case class Done[E, A](value: ExitResult[E, A])          extends State[E, A]
+    sealed trait State[E, A]                                        extends Serializable with Product
+    final case class Pending[E, A](joiners: List[IO[E, A] => Unit]) extends State[E, A]
+    final case class Done[E, A](value: IO[E, A])                    extends State[E, A]
   }
 }
